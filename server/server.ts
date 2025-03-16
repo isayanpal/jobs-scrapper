@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "fs";
 
 dotenv.config();
 
@@ -18,36 +19,80 @@ let cachedData: {
 }[] = [];
 let lastUpdated = 0;
 
-// const REMOTIVE_API_URL = "https://remotive.io/api/remote-jobs?category=software-dev";
-const REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs?search=front%20end";
+const CACHE_FILE = "./cache.json"; // File to store cached job posts
+const JSEARCH_API_URL = "https://jsearch.p.rapidapi.com/search";
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_HOST = "jsearch.p.rapidapi.com";
 
-// Function to fetch job postings from Remotive API
-const fetchJobPostsFromRemotive = async () => {
+interface Job {
+  job_title: string;
+  employer_name: string;
+  job_city?: string;
+  job_state?: string;
+  job_apply_link: string;
+  job_posted_at_datetime_utc: string;
+}
+
+// Function to load cache from file
+const loadCache = () => {
   try {
-    console.log("🔍 Fetching job posts from Remotive API...");
+    if (fs.existsSync(CACHE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CACHE_FILE, "utf-8"));
+      if (data.jobPosts && data.lastUpdated) {
+        cachedData = data.jobPosts;
+        lastUpdated = data.lastUpdated;
+        console.log("✅ Cache loaded from file.",cachedData);
+      }
+    }
+  } catch (error) {
+    console.error("❌ Error loading cache:", error);
+  }
+};
 
-    const response = await axios.get(REMOTIVE_API_URL);
-    const jobs = response.data.jobs || [];
-
-    const jobPosts = jobs.map((job: any) => ({
-      title: job.title,
-      company: job.company_name,
-      location: job.candidate_required_location,
-      url: job.url,
-      date: job.publication_date,
-    }));
-
-    // Sort job posts by publication date in descending order
-    jobPosts.sort(
-      (a: { date: string }, b: { date: string }) =>
-        new Date(b.date).getTime() - new Date(a.date).getTime()
+// Function to save cache to file
+const saveCache = () => {
+  try {
+    fs.writeFileSync(
+      CACHE_FILE,
+      JSON.stringify({ jobPosts: cachedData, lastUpdated }, null, 2)
     );
+    console.log("✅ Cache saved to file.");
+  } catch (error) {
+    console.error("❌ Error saving cache:", error);
+  }
+};
 
-    console.log("Fetched job posts:", jobPosts); // Log the fetched job posts
-    return jobPosts;
+// Function to fetch job postings from JSearch API
+const fetchJobPostsFromJSearch = async (query: string) => {
+  try {
+    console.log(`🔍 Fetching job posts from JSearch API with query: ${query}...`);
+
+    const response = await axios.get(JSEARCH_API_URL, {
+      headers: {
+        "X-RapidAPI-Key": RAPIDAPI_KEY!,
+        "X-RapidAPI-Host": RAPIDAPI_HOST,
+      },
+      params: {
+        query,
+        page: "1",
+        num_pages: "1",
+      },
+    });
+
+    const jobs: Job[] = response.data.data || [];
+
+    return jobs
+      .map((job: Job) => ({
+        title: job.job_title,
+        company: job.employer_name,
+        location: job.job_city || job.job_state || "Remote",
+        url: job.job_apply_link,
+        date: job.job_posted_at_datetime_utc,
+      }))
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   } catch (error) {
     console.error(
-      "❌ Error fetching job posts from Remotive:",
+      "❌ Error fetching job posts from JSearch:",
       (error as Error).message
     );
     return [];
@@ -58,15 +103,26 @@ const fetchJobPostsFromRemotive = async () => {
 const updateCache = async () => {
   console.log("🔄 Refreshing cached job posts...");
   try {
-    const jobPosts = await fetchJobPostsFromRemotive();
-    cachedData = jobPosts;
+    const jobPosts = await fetchJobPostsFromJSearch(
+      "Frontend Developer OR FullStack Developer"
+    );
+
+    // Sort all jobs by date (latest first)
+    const allPosts = jobPosts.sort((a, b) => 
+      new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
+
+    cachedData = allPosts;
     lastUpdated = Date.now();
-    console.log("✅ Cache updated successfully!");
-    console.log("Cached job posts:", cachedData); // Log the cached job posts
+
+    saveCache();
+    console.log(`✅ Cache updated with ${cachedData.length} jobs!`,cachedData);
   } catch (error) {
-    console.error("❌ Error updating cache:", (error as Error).message);
+    console.error("❌ Error updating cache:", error);
   }
 };
+
+
 
 // API to get job posts (fetch from cache or update if outdated)
 app.get("/scrape-job-posts", async (_, res) => {
@@ -93,8 +149,19 @@ app.get("/refresh-cache", async (_, res) => {
   res.json({ success: true, message: "Cache refreshed successfully!" });
 });
 
+// Load cache on server start
+loadCache();
 
-app.listen(PORT, () => {
+// Start the server
+app.listen(PORT, async () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-  updateCache();
+
+  // Only update cache if there is no valid cached data
+  const TWO_HOURS = 2 * 60 * 60 * 1000;
+  if (Date.now() - lastUpdated > TWO_HOURS || cachedData.length === 0) {
+    console.log("⏳ No valid cache found. Fetching new data...");
+    await updateCache();
+  } else {
+    console.log("✅ Using existing cached data.");
+  }
 });
